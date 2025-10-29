@@ -151,37 +151,60 @@ app.get('/api/ipfs/test', async (req, res) => {
 });
 
 // Store TFT model with metadata
+// Store TFT model with metadata
 app.post('/api/ml/store-model', async (req, res) => {
   try {
     const { 
+      model_data,
       model_weights,
-      model_architecture,
-      training_config,
       performance_metrics,
+      shap_analysis,
       model_metadata 
     } = req.body;
 
+    console.log('🧠 Storing TFT model on IPFS...');
+    console.log(`   - Model metadata: ${JSON.stringify(model_metadata || {}).length} chars`);
+    console.log(`   - Model weights: ${model_weights ? (model_weights.length / 1024 / 1024).toFixed(2) + ' MB' : 'NOT PROVIDED'}`);
+    console.log(`   - Performance metrics: ${Object.keys(performance_metrics || {}).length} keys`);
+    console.log(`   - SHAP analysis: ${Object.keys(shap_analysis || {}).length} features`);
+
+    // Construct complete model package
     const modelPackage = {
       type: 'tft_churn_model',
-      version: '1.0.0',
+      version: model_metadata?.version || '1.0.0',
+      modelName: model_metadata?.modelName || 'retail-churn-tft',
       timestamp: new Date().toISOString(),
-      model_weights: model_weights,
-      model_architecture: model_architecture,
-      training_config: training_config,
-      performance_metrics: performance_metrics,
-      metadata: model_metadata || {}
+      
+      // Core model data
+      model_weights: model_weights,  // ✅ Store weights at top level
+      model_data: model_data,
+      
+      // Analysis and metrics
+      performance_metrics: performance_metrics || {},
+      shap_analysis: shap_analysis || {},
+      
+      // Metadata
+      metadata: model_metadata || {},
+      
+      // Storage info
+      storage: {
+        hasWeights: !!model_weights,
+        weightsSize: model_weights ? model_weights.length : 0,
+        storedAt: new Date().toISOString(),
+        service: 'retail-ml-ipfs-service'
+      }
     };
 
-    console.log('🧠 Storing TFT model on IPFS...');
-
+    // Upload to IPFS
     const ipfsResult = await ipfsService.uploadToIPFS(
       JSON.stringify(modelPackage, null, 2),
       {
-        modelName: model_metadata?.name || 'retail-churn-tft',
+        modelName: model_metadata?.modelName || 'retail-churn-tft',
         version: model_metadata?.version || '1.0.0',
         accuracy: performance_metrics?.accuracy || 0,
         modelType: 'temporal_fusion_transformer',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        hasWeights: !!model_weights
       }
     );
 
@@ -194,6 +217,8 @@ app.post('/api/ml/store-model', async (req, res) => {
         ipfsHash: ipfsResult.ipfsHash,
         ipfsUrl: ipfsResult.ipfsUrl,
         timestamp: new Date().toISOString(),
+        hasWeights: !!model_weights,
+        weightsSize: model_weights ? (model_weights.length / 1024 / 1024).toFixed(2) + ' MB' : '0 MB',
         message: 'TFT model stored successfully on IPFS'
       }
     });
@@ -208,24 +233,36 @@ app.post('/api/ml/store-model', async (req, res) => {
 });
 
 // Retrieve TFT model
+// Retrieve TFT model
 app.get('/api/ml/get-model/:hash', async (req, res) => {
   try {
     const { hash } = req.params;
     
     console.log(`📥 Retrieving TFT model: ${hash}`);
     const modelData = await ipfsService.getFromIPFS(hash);
-    const modelPackage = JSON.parse(modelData);
+    const rawData = JSON.parse(modelData);
+    
+    // Extract the actual model package (it's nested in 'data')
+    const modelPackage = rawData.data ? JSON.parse(rawData.data) : rawData;
+    
+    console.log(`✅ Model retrieved. Has weights: ${!!modelPackage.model_weights}`);
+    if (modelPackage.model_weights) {
+      console.log(`   Weights size: ${(modelPackage.model_weights.length / 1024 / 1024).toFixed(2)} MB`);
+    }
     
     res.json({
       success: true,
-      data: {
+      data: modelPackage,  // Return the unwrapped model package
+      metadata: {
         ipfsHash: hash,
-        modelPackage: modelPackage,
-        retrievedAt: new Date().toISOString()
+        retrievedAt: new Date().toISOString(),
+        hasWeights: !!modelPackage.model_weights,
+        weightsSize: modelPackage.model_weights ? modelPackage.model_weights.length : 0
       }
     });
 
   } catch (error) {
+    console.error('❌ Error retrieving model:', error);
     res.status(500).json({
       success: false,
       error: error.message
