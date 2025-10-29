@@ -271,6 +271,408 @@ app.use('*', (req, res) => {
   });
 });
 
+// Add this endpoint to your server.js file
+
+// List all stored models
+app.get('/api/ml/list-models', async (req, res) => {
+  try {
+    const { 
+      limit = 50, 
+      offset = 0,
+      sortBy = 'date', // date, name, accuracy
+      order = 'desc' // asc, desc
+    } = req.query;
+
+    console.log('📋 Fetching list of stored models...');
+    
+    // Get all pinned files from Pinata
+    const pinnedFiles = await ipfsService.listPinnedFiles(parseInt(limit));
+    
+    if (!pinnedFiles.success) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to retrieve model list',
+        details: pinnedFiles.error
+      });
+    }
+
+    // Filter and format model data
+    const models = pinnedFiles.rows
+      .filter(file => {
+        // Filter only ML model files
+        return file.metadata?.keyvalues?.type === 'ml-model' || 
+               file.metadata?.keyvalues?.modelType === 'temporal_fusion_transformer' ||
+               file.name?.includes('model') ||
+               file.name?.includes('tft');
+      })
+      .map(file => ({
+        modelId: file.ipfsHash,
+        ipfsHash: file.ipfsHash,
+        name: file.name,
+        modelType: file.metadata?.keyvalues?.modelType || 'unknown',
+        version: file.metadata?.keyvalues?.version || '1.0.0',
+        accuracy: parseFloat(file.metadata?.keyvalues?.accuracy || 0),
+        size: file.size,
+        sizeFormatted: formatBytes(file.size),
+        uploadedAt: file.timestamp,
+        ipfsUrl: `https://gateway.pinata.cloud/ipfs/${file.ipfsHash}`,
+        publicUrl: `https://ipfs.io/ipfs/${file.ipfsHash}`,
+        metadata: file.metadata?.keyvalues || {},
+        gateways: {
+          pinata: `https://gateway.pinata.cloud/ipfs/${file.ipfsHash}`,
+          ipfsIo: `https://ipfs.io/ipfs/${file.ipfsHash}`,
+          cloudflare: `https://cloudflare-ipfs.com/ipfs/${file.ipfsHash}`
+        }
+      }));
+
+    // Sort models
+    const sortedModels = sortModels(models, sortBy, order);
+
+    // Apply pagination
+    const startIndex = parseInt(offset);
+    const endIndex = startIndex + parseInt(limit);
+    const paginatedModels = sortedModels.slice(startIndex, endIndex);
+
+    console.log(`✅ Found ${models.length} models, returning ${paginatedModels.length}`);
+
+    res.json({
+      success: true,
+      data: {
+        models: paginatedModels,
+        pagination: {
+          total: models.length,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          returned: paginatedModels.length,
+          hasMore: endIndex < models.length
+        },
+        summary: {
+          totalModels: models.length,
+          totalSize: models.reduce((sum, m) => sum + m.size, 0),
+          totalSizeFormatted: formatBytes(models.reduce((sum, m) => sum + m.size, 0)),
+          modelTypes: [...new Set(models.map(m => m.modelType))],
+          averageAccuracy: models.length > 0 
+            ? (models.reduce((sum, m) => sum + m.accuracy, 0) / models.length).toFixed(4)
+            : 0
+        }
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error listing models:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get specific model details with full metadata
+app.get('/api/ml/model-details/:hash', async (req, res) => {
+  try {
+    const { hash } = req.params;
+    
+    if (!ipfsService.isValidIPFSHash(hash)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid IPFS hash format'
+      });
+    }
+
+    console.log(`📊 Fetching detailed model info: ${hash}`);
+    
+    // Get pin status and metadata
+    const pinStatus = await ipfsService.getPinStatus(hash);
+    
+    // Get actual model data
+    const modelData = await ipfsService.getFromIPFS(hash);
+    const modelPackage = JSON.parse(modelData);
+
+    res.json({
+      success: true,
+      data: {
+        ipfsHash: hash,
+        pinned: pinStatus.pinned,
+        pinInfo: pinStatus.data || null,
+        modelPackage: modelPackage,
+        gateways: ipfsService.getGateways(hash),
+        retrievedAt: new Date().toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error fetching model details:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Search models by criteria
+app.get('/api/ml/search-models', async (req, res) => {
+  try {
+    const { 
+      query,
+      modelType,
+      minAccuracy,
+      maxAccuracy,
+      fromDate,
+      toDate,
+      limit = 50
+    } = req.query;
+
+    console.log('🔍 Searching models with criteria...');
+    
+    const pinnedFiles = await ipfsService.listPinnedFiles(parseInt(limit) * 2);
+    
+    if (!pinnedFiles.success) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to search models'
+      });
+    }
+
+    let models = pinnedFiles.rows
+      .filter(file => {
+        return file.metadata?.keyvalues?.type === 'ml-model' || 
+               file.metadata?.keyvalues?.modelType === 'temporal_fusion_transformer' ||
+               file.name?.includes('model');
+      })
+      .map(file => ({
+        modelId: file.ipfsHash,
+        ipfsHash: file.ipfsHash,
+        name: file.name,
+        modelType: file.metadata?.keyvalues?.modelType || 'unknown',
+        version: file.metadata?.keyvalues?.version || '1.0.0',
+        accuracy: parseFloat(file.metadata?.keyvalues?.accuracy || 0),
+        uploadedAt: file.timestamp,
+        ipfsUrl: `https://gateway.pinata.cloud/ipfs/${file.ipfsHash}`,
+        metadata: file.metadata?.keyvalues || {}
+      }));
+
+    // Apply filters
+    if (query) {
+      const searchQuery = query.toLowerCase();
+      models = models.filter(m => 
+        m.name.toLowerCase().includes(searchQuery) ||
+        m.modelType.toLowerCase().includes(searchQuery) ||
+        m.version.includes(searchQuery)
+      );
+    }
+
+    if (modelType) {
+      models = models.filter(m => m.modelType === modelType);
+    }
+
+    if (minAccuracy) {
+      models = models.filter(m => m.accuracy >= parseFloat(minAccuracy));
+    }
+
+    if (maxAccuracy) {
+      models = models.filter(m => m.accuracy <= parseFloat(maxAccuracy));
+    }
+
+    if (fromDate) {
+      const from = new Date(fromDate);
+      models = models.filter(m => new Date(m.uploadedAt) >= from);
+    }
+
+    if (toDate) {
+      const to = new Date(toDate);
+      models = models.filter(m => new Date(m.uploadedAt) <= to);
+    }
+
+    // Limit results
+    models = models.slice(0, parseInt(limit));
+
+    console.log(`✅ Search returned ${models.length} models`);
+
+    res.json({
+      success: true,
+      data: {
+        models: models,
+        count: models.length,
+        searchCriteria: {
+          query,
+          modelType,
+          minAccuracy,
+          maxAccuracy,
+          fromDate,
+          toDate
+        }
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error searching models:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Get model statistics
+app.get('/api/ml/statistics', async (req, res) => {
+  try {
+    console.log('📊 Calculating model statistics...');
+    
+    const pinnedFiles = await ipfsService.listPinnedFiles(1000);
+    
+    if (!pinnedFiles.success) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to retrieve statistics'
+      });
+    }
+
+    const models = pinnedFiles.rows.filter(file => {
+      return file.metadata?.keyvalues?.type === 'ml-model' || 
+             file.metadata?.keyvalues?.modelType === 'temporal_fusion_transformer' ||
+             file.name?.includes('model');
+    });
+
+    const stats = {
+      totalModels: models.length,
+      totalStorage: models.reduce((sum, m) => sum + m.size, 0),
+      totalStorageFormatted: formatBytes(models.reduce((sum, m) => sum + m.size, 0)),
+      
+      modelsByType: {},
+      accuracyDistribution: {
+        high: 0,    // > 0.9
+        medium: 0,  // 0.7 - 0.9
+        low: 0      // < 0.7
+      },
+      
+      recentUploads: {
+        last24h: 0,
+        last7d: 0,
+        last30d: 0
+      },
+      
+      averageAccuracy: 0,
+      bestModel: null,
+      latestModel: null
+    };
+
+    const now = new Date();
+    let totalAccuracy = 0;
+    let validAccuracyCount = 0;
+    let bestAccuracy = 0;
+    let bestModel = null;
+
+    models.forEach(file => {
+      const modelType = file.metadata?.keyvalues?.modelType || 'unknown';
+      stats.modelsByType[modelType] = (stats.modelsByType[modelType] || 0) + 1;
+
+      const accuracy = parseFloat(file.metadata?.keyvalues?.accuracy || 0);
+      if (accuracy > 0) {
+        totalAccuracy += accuracy;
+        validAccuracyCount++;
+
+        if (accuracy > 0.9) stats.accuracyDistribution.high++;
+        else if (accuracy >= 0.7) stats.accuracyDistribution.medium++;
+        else stats.accuracyDistribution.low++;
+
+        if (accuracy > bestAccuracy) {
+          bestAccuracy = accuracy;
+          bestModel = {
+            name: file.name,
+            ipfsHash: file.ipfsHash,
+            accuracy: accuracy,
+            modelType: modelType
+          };
+        }
+      }
+
+      const uploadDate = new Date(file.timestamp);
+      const hoursDiff = (now - uploadDate) / (1000 * 60 * 60);
+      
+      if (hoursDiff <= 24) stats.recentUploads.last24h++;
+      if (hoursDiff <= 168) stats.recentUploads.last7d++;
+      if (hoursDiff <= 720) stats.recentUploads.last30d++;
+    });
+
+    if (validAccuracyCount > 0) {
+      stats.averageAccuracy = (totalAccuracy / validAccuracyCount).toFixed(4);
+    }
+
+    stats.bestModel = bestModel;
+    
+    if (models.length > 0) {
+      const latestFile = models.sort((a, b) => 
+        new Date(b.timestamp) - new Date(a.timestamp)
+      )[0];
+      
+      stats.latestModel = {
+        name: latestFile.name,
+        ipfsHash: latestFile.ipfsHash,
+        uploadedAt: latestFile.timestamp,
+        modelType: latestFile.metadata?.keyvalues?.modelType || 'unknown'
+      };
+    }
+
+    console.log('✅ Statistics calculated');
+
+    res.json({
+      success: true,
+      data: stats,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error calculating statistics:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Helper function to format bytes
+function formatBytes(bytes, decimals = 2) {
+  if (bytes === 0) return '0 Bytes';
+  
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+// Helper function to sort models
+function sortModels(models, sortBy, order) {
+  const sorted = [...models].sort((a, b) => {
+    let comparison = 0;
+    
+    switch (sortBy) {
+      case 'date':
+        comparison = new Date(b.uploadedAt) - new Date(a.uploadedAt);
+        break;
+      case 'name':
+        comparison = a.name.localeCompare(b.name);
+        break;
+      case 'accuracy':
+        comparison = b.accuracy - a.accuracy;
+        break;
+      case 'size':
+        comparison = b.size - a.size;
+        break;
+      default:
+        comparison = new Date(b.uploadedAt) - new Date(a.uploadedAt);
+    }
+    
+    return order === 'asc' ? -comparison : comparison;
+  });
+  
+  return sorted;
+}
+
 // Start server
 app.listen(PORT, () => {
   console.log(`
