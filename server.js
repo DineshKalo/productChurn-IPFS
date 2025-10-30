@@ -370,7 +370,7 @@ app.get('/api/ml/list-models', async (req, res) => {
     const endIndex = startIndex + parseInt(limit);
     const paginatedModels = sortedModels.slice(startIndex, endIndex);
 
-    console.log(`✅ Found ${models.length} models, returning ${paginatedModels.length}`);
+    console.log(`Found ${models.length} models, returning ${paginatedModels.length}`);
 
     res.json({
       success: true,
