@@ -207,45 +207,144 @@ class IPFSService {
     }
   }
 
-  async listPinnedFiles(limit = 10) {
-    try {
-      console.log('📋 Listing pinned files...');
+  async listPinnedFiles(limit = 1000, status = 'all') {
+  try {
+    console.log('📋 Listing pinned files...');
+    
+    let allFiles = [];
+    let pageOffset = 0;
+    const pageLimit = 100; // Pinata's max per page
+    
+    // Paginate through all files
+    while (true) {
+      let url = `${this.baseURL}/data/pinList?pageLimit=${pageLimit}&pageOffset=${pageOffset}`;
       
-      const response = await axios.get(
-        `${this.baseURL}/data/pinList?status=pinned&pageLimit=${limit}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${this.pinataJWT}`
-          },
-          timeout: 15000
-        }
-      );
+      if (status !== 'all') {
+        url += `&status=${status}`;
+      }
       
-      console.log(`✅ Found ${response.data.count} pinned files`);
+      const response = await axios.get(url, {
+        headers: {
+          'Authorization': `Bearer ${this.pinataJWT}`
+        },
+        timeout: 30000
+      });
       
-      return {
-        success: true,
-        count: response.data.count,
-        rows: response.data.rows.map(file => ({
-          ipfsHash: file.ipfs_pin_hash,
-          name: file.metadata.name,
-          size: file.size,
-          timestamp: file.date_pinned,
-          metadata: file.metadata
-        })),
-        timestamp: new Date().toISOString()
-      };
-    } catch (error) {
-      console.error('❌ Failed to list pinned files:', error.response?.data || error.message);
+      if (!response.data.rows || response.data.rows.length === 0) {
+        break;
+      }
       
-      return {
-        success: false,
-        error: error.response?.data?.error || error.message,
-        message: 'Failed to list pinned files',
-        timestamp: new Date().toISOString()
-      };
+      allFiles = [...allFiles, ...response.data.rows];
+      pageOffset += pageLimit;
+      
+      // Stop if we've reached the requested limit or no more files
+      if (allFiles.length >= limit || response.data.rows.length < pageLimit) {
+        break;
+      }
     }
+    
+    console.log(`✅ Found ${allFiles.length} total files`);
+    
+    return {
+      success: true,
+      count: allFiles.length,
+      rows: allFiles.map(file => ({
+        ipfs_pin_hash: file.ipfs_pin_hash,
+        name: file.metadata ? file.metadata.name : `file-${file.ipfs_pin_hash.substring(0, 8)}`,
+        size: file.size,
+        date_pinned: file.date_pinned,
+        metadata: file.metadata || {},
+        status: 'pinned'
+      })),
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error('❌ Failed to list pinned files:', error.response?.data || error.message);
+    
+    return {
+      success: false,
+      error: error.response?.data?.error || error.message,
+      message: 'Failed to list pinned files',
+      timestamp: new Date().toISOString()
+    };
   }
+}
+
+  async listUnpinnedFiles(limit = 100) {
+  try {
+    console.log('📋 Listing unpinned files...');
+    
+    const response = await axios.get(
+      `${this.baseURL}/data/pinList?status=unpinned&pageLimit=${limit}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${this.pinataJWT}`
+        },
+        timeout: 15000
+      }
+    );
+    
+    console.log(`✅ Found ${response.data.count} unpinned files`);
+    
+    return {
+      success: true,
+      count: response.data.count,
+      rows: response.data.rows.map(file => ({
+        ipfs_pin_hash: file.ipfs_pin_hash,
+        name: file.metadata ? file.metadata.name : `unpinned-${file.ipfs_pin_hash.substring(0, 8)}`,
+        size: file.size,
+        date_pinned: file.date_pinned,
+        metadata: file.metadata || {},
+        status: 'unpinned'
+      })),
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error('❌ Failed to list unpinned files:', error.response?.data || error.message);
+    
+    return {
+      success: false,
+      error: error.response?.data?.error || error.message,
+      message: 'Failed to list unpinned files',
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+async listAllFiles(limit = 1000) {
+  try {
+    console.log('📋 Listing all files (pinned + unpinned)...');
+    
+    const [pinnedResult, unpinnedResult] = await Promise.all([
+      this.listPinnedFiles(limit, 'all'),
+      this.listUnpinnedFiles(limit)
+    ]);
+    
+    const allFiles = [
+      ...(pinnedResult.success ? pinnedResult.rows : []),
+      ...(unpinnedResult.success ? unpinnedResult.rows : [])
+    ];
+    
+    console.log(`✅ Found ${allFiles.length} total files (${pinnedResult.rows?.length || 0} pinned, ${unpinnedResult.rows?.length || 0} unpinned)`);
+    
+    return {
+      success: true,
+      count: allFiles.length,
+      rows: allFiles,
+      pinnedCount: pinnedResult.rows?.length || 0,
+      unpinnedCount: unpinnedResult.rows?.length || 0,
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    console.error('❌ Failed to list all files:', error);
+    return {
+      success: false,
+      error: error.message,
+      message: 'Failed to list all files',
+      timestamp: new Date().toISOString()
+    };
+  }
+}
 
   async unpinFile(ipfsHash) {
     try {

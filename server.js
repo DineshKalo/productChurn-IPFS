@@ -117,67 +117,82 @@ app.get('/api/ipfs/test', async (req, res) => {
 // ============================================
 
 // List all stored models - MOVED UP BEFORE PARAMETERIZED ROUTES
+// List all stored models - with pinned and unpinned support
 app.get('/api/ml/list-models', async (req, res) => {
   try {
     const { 
-      limit = 50, 
+      limit = 100, 
       offset = 0,
       sortBy = 'date',
-      order = 'desc'
+      order = 'desc',
+      includeUnpinned = 'false',
+      status = 'all' // 'pinned', 'unpinned', 'all'
     } = req.query;
 
     console.log('📋 Fetching list of stored models...');
-    console.log(`   Limit: ${limit}, Offset: ${offset}, Sort: ${sortBy} ${order}`);
+    console.log(`   Limit: ${limit}, Offset: ${offset}, Sort: ${sortBy} ${order}, Include Unpinned: ${includeUnpinned}, Status: ${status}`);
     
-    // Get all pinned files from Pinata
-    const pinnedFiles = await ipfsService.listPinnedFiles(parseInt(limit));
+    // Get files based on status filter
+    let filesResult;
+    if (status === 'all' || includeUnpinned === 'true') {
+      filesResult = await ipfsService.listAllFiles(parseInt(limit) * 3);
+    } else {
+      filesResult = await ipfsService.listPinnedFiles(parseInt(limit) * 3, status);
+    }
     
-    console.log('📦 Pinned files response:', {
-      success: pinnedFiles.success,
-      count: pinnedFiles.rows?.length || 0
+    console.log('📦 Files response:', {
+      success: filesResult.success,
+      totalCount: filesResult.count,
+      pinnedCount: filesResult.pinnedCount,
+      unpinnedCount: filesResult.unpinnedCount
     });
     
-    if (!pinnedFiles.success) {
+    if (!filesResult.success) {
       return res.status(500).json({
         success: false,
         error: 'Failed to retrieve model list',
-        details: pinnedFiles.error
+        details: filesResult.error
       });
     }
 
-    // Filter and format model data
-    const models = pinnedFiles.rows
-      .filter(file => {
+    // Filter and format model data - include all files for transparency
+    const models = filesResult.rows
+      .map(file => {
         const metadata = file.metadata?.keyvalues || {};
         const name = file.name || '';
         
-        // Filter only ML model files
-        return metadata.type === 'ml-model' || 
-               metadata.modelType === 'temporal_fusion_transformer' ||
-               name.includes('model') ||
-               name.includes('tft');
-      })
-      .map(file => ({
-        modelId: file.ipfsHash,
-        ipfsHash: file.ipfsHash,
-        name: file.name,
-        modelType: file.metadata?.keyvalues?.modelType || 'unknown',
-        version: file.metadata?.keyvalues?.version || '1.0.0',
-        accuracy: parseFloat(file.metadata?.keyvalues?.accuracy || 0),
-        size: file.size,
-        sizeFormatted: formatBytes(file.size),
-        uploadedAt: file.timestamp,
-        ipfsUrl: `https://gateway.pinata.cloud/ipfs/${file.ipfsHash}`,
-        publicUrl: `https://ipfs.io/ipfs/${file.ipfsHash}`,
-        metadata: file.metadata?.keyvalues || {},
-        gateways: {
-          pinata: `https://gateway.pinata.cloud/ipfs/${file.ipfsHash}`,
-          ipfsIo: `https://ipfs.io/ipfs/${file.ipfsHash}`,
-          cloudflare: `https://cloudflare-ipfs.com/ipfs/${file.ipfsHash}`
-        }
-      }));
+        // Determine if it's an ML model
+        const isMLModel = metadata.type === 'ml-model' || 
+                         metadata.modelType === 'temporal_fusion_transformer' ||
+                         name.includes('model') ||
+                         name.includes('tft') ||
+                         name.includes('retail') ||
+                         name.includes('churn');
 
-    console.log(`✅ Filtered ${models.length} ML models from ${pinnedFiles.rows.length} total files`);
+        return {
+          modelId: file.ipfs_pin_hash,
+          ipfsHash: file.ipfs_pin_hash,
+          name: file.name,
+          modelType: metadata.modelType || (isMLModel ? 'ml-model' : 'unknown'),
+          version: metadata.version || '1.0.0',
+          accuracy: parseFloat(metadata.accuracy || 0),
+          size: file.size,
+          sizeFormatted: formatBytes(file.size),
+          uploadedAt: file.date_pinned,
+          status: file.status || 'unknown',
+          ipfsUrl: `https://gateway.pinata.cloud/ipfs/${file.ipfs_pin_hash}`,
+          publicUrl: `https://ipfs.io/ipfs/${file.ipfs_pin_hash}`,
+          metadata: metadata,
+          isMLModel: isMLModel,
+          gateways: {
+            pinata: `https://gateway.pinata.cloud/ipfs/${file.ipfs_pin_hash}`,
+            ipfsIo: `https://ipfs.io/ipfs/${file.ipfs_pin_hash}`,
+            cloudflare: `https://cloudflare-ipfs.com/ipfs/${file.ipfs_pin_hash}`
+          }
+        };
+      });
+
+    console.log(`✅ Processed ${models.length} files, ${models.filter(m => m.isMLModel).length} identified as ML models`);
 
     // Sort models
     const sortedModels = sortModels(models, sortBy, order);
@@ -186,6 +201,11 @@ app.get('/api/ml/list-models', async (req, res) => {
     const startIndex = parseInt(offset);
     const endIndex = startIndex + parseInt(limit);
     const paginatedModels = sortedModels.slice(startIndex, endIndex);
+
+    // Calculate statistics
+    const mlModels = models.filter(m => m.isMLModel);
+    const pinnedModels = models.filter(m => m.status === 'pinned');
+    const unpinnedModels = models.filter(m => m.status === 'unpinned');
 
     res.json({
       success: true,
@@ -199,13 +219,22 @@ app.get('/api/ml/list-models', async (req, res) => {
           hasMore: endIndex < models.length
         },
         summary: {
-          totalModels: models.length,
+          totalFiles: models.length,
+          mlModels: mlModels.length,
+          pinnedFiles: pinnedModels.length,
+          unpinnedFiles: unpinnedModels.length,
           totalSize: models.reduce((sum, m) => sum + m.size, 0),
           totalSizeFormatted: formatBytes(models.reduce((sum, m) => sum + m.size, 0)),
-          modelTypes: [...new Set(models.map(m => m.modelType))],
-          averageAccuracy: models.length > 0 
-            ? (models.reduce((sum, m) => sum + m.accuracy, 0) / models.length).toFixed(4)
+          modelTypes: [...new Set(mlModels.map(m => m.modelType))],
+          averageAccuracy: mlModels.length > 0 
+            ? (mlModels.reduce((sum, m) => sum + m.accuracy, 0) / mlModels.length).toFixed(4)
             : 0
+        },
+        filters: {
+          status: status,
+          includeUnpinned: includeUnpinned === 'true',
+          sortBy: sortBy,
+          order: order
         }
       },
       timestamp: new Date().toISOString()
@@ -217,6 +246,77 @@ app.get('/api/ml/list-models', async (req, res) => {
       success: false,
       error: error.message,
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Get comprehensive file status and statistics
+app.get('/api/ml/file-status', async (req, res) => {
+  try {
+    console.log('📊 Getting comprehensive file status...');
+    
+    const allFiles = await ipfsService.listAllFiles(1000);
+    
+    if (!allFiles.success) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to retrieve file status'
+      });
+    }
+
+    const files = allFiles.rows;
+    
+    const status = {
+      totalFiles: files.length,
+      pinned: files.filter(f => f.status === 'pinned').length,
+      unpinned: files.filter(f => f.status === 'unpinned').length,
+      
+      mlModels: files.filter(f => {
+        const metadata = f.metadata?.keyvalues || {};
+        return metadata.type === 'ml-model' || 
+               metadata.modelType === 'temporal_fusion_transformer' ||
+               f.name?.includes('model');
+      }).length,
+      
+      storage: {
+        total: files.reduce((sum, f) => sum + f.size, 0),
+        pinned: files.filter(f => f.status === 'pinned').reduce((sum, f) => sum + f.size, 0),
+        unpinned: files.filter(f => f.status === 'unpinned').reduce((sum, f) => sum + f.size, 0)
+      },
+      
+      recentActivity: {
+        last24h: files.filter(f => {
+          const fileDate = new Date(f.date_pinned);
+          const hoursDiff = (new Date() - fileDate) / (1000 * 60 * 60);
+          return hoursDiff <= 24;
+        }).length,
+        
+        last7d: files.filter(f => {
+          const fileDate = new Date(f.date_pinned);
+          const daysDiff = (new Date() - fileDate) / (1000 * 60 * 60 * 24);
+          return daysDiff <= 7;
+        }).length
+      }
+    };
+
+    // Format storage sizes
+    status.storage.totalFormatted = formatBytes(status.storage.total);
+    status.storage.pinnedFormatted = formatBytes(status.storage.pinned);
+    status.storage.unpinnedFormatted = formatBytes(status.storage.unpinned);
+
+    console.log('✅ File status calculated');
+
+    res.json({
+      success: true,
+      data: status,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('❌ Error getting file status:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
